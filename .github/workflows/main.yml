@@ -1,0 +1,71 @@
+name: Linux RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360 # GitHub এর ফ্রি টিয়ারে সর্বোচ্চ ৬ ঘণ্টা
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Install Desktop Environment and RDP Server
+        run: |
+          # apt প্যাকেজ লিস্ট আপডেট করা হচ্ছে
+          sudo apt-get update
+          
+          # প্রয়োজনীয় সফটওয়্যার ইনস্টল করা হচ্ছে
+          # xfce4: হালকা ডেস্কটপ এনভায়রনমেন্ট
+          # xfce4-goodies: ডেস্কটপের জন্য কিছু অতিরিক্ত টুলস
+          # xrdp: RDP সার্ভার
+          sudo apt-get install -y xfce4 xfce4-goodies xrdp
+          
+          # xrdp ইউজারকে ssl-cert গ্রুপে যোগ করা হচ্ছে, যা சில ক্ষেত্রে প্রয়োজন হয়
+          sudo adduser xrdp ssl-cert
+          
+          # xrdp কে বলা হচ্ছে যেন XFCE সেশন ব্যবহার করে
+          echo "xfce4-session" | sudo tee /etc/xrdp/startwm.sh
+          
+          # xrdp সার্ভিস রিস্টার্ট দেওয়া হচ্ছে যাতে পরিবর্তনগুলো কার্যকর হয়
+          sudo systemctl restart xrdp
+
+      - name: Create a new user for RDP
+        run: |
+          # 'runner' নামে একটি নতুন ইউজার তৈরি করা হচ্ছে যার পাসওয়ার্ড হবে 'password'
+          # দ্রষ্টব্য: এখানে একটি দুর্বল পাসওয়ার্ড ব্যবহার করা হয়েছে, কিন্তু বাস্তবে GitHub Secrets ব্যবহার করা উচিত
+          sudo useradd -m -s /bin/bash runner
+          echo "runner:password" | sudo chpasswd
+          sudo adduser runner sudo # ইউজারকে sudo পারমিশন দেওয়া হচ্ছে
+
+      - name: Install and configure Tailscale
+        run: |
+          # Tailscale ইনস্টল করার স্ক্রিপ্ট চালানো হচ্ছে
+          curl -fsSL https://tailscale.com/install.sh | sh
+          
+          # Tailscale চালু করা হচ্ছে এবং আপনার অ্যাকাউন্টে যুক্ত করা হচ্ছে
+          # TAILSCALE_AUTH_KEY টিকে অবশ্যই আপনার GitHub repository-র Secrets এ যোগ করতে হবে
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-linux-$GITHUB_RUN_ID
+          
+          # Tailscale IP অ্যাড্রেস বের করা হচ্ছে
+          TS_IP=$(tailscale ip -4)
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+
+      - name: Maintain Connection and Display Info
+        run: |
+          echo "========================================"
+          echo "          LINUX RDP ACCESS"
+          echo "========================================"
+          echo "Tailscale IP: ${{ env.TAILSCALE_IP }}"
+          echo "Username: runner"
+          echo "Password: password"
+          echo "========================================"
+          echo "Use Ctrl+C in the workflow log to terminate."
+          
+          # ওয়ার্কফ্লোটিকে ৬ ঘণ্টা চালু রাখার জন্য একটি অসীম লুপ
+          while true; do
+            sleep 300 # প্রতি ৫ মিনিট পর পর বার্তা দেখাবে
+            echo "[$(date)] RDP session is active."
+          done
