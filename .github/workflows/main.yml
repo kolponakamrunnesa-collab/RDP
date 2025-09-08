@@ -1,71 +1,93 @@
-name: Linux RDP
+name: SSH Access
 
 on:
   workflow_dispatch:
 
 jobs:
-  build:
+  ssh-access:
     runs-on: ubuntu-latest
-    timeout-minutes: 360 # GitHub এর ফ্রি টিয়ারে সর্বোচ্চ ৬ ঘণ্টা
+    timeout-minutes: 3600
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
-
-      - name: Install Desktop Environment and RDP Server
+      - name: SSH সার্ভার সেটআপ করুন
         run: |
-          # apt প্যাকেজ লিস্ট আপডেট করা হচ্ছে
+          # Ubuntu রানারে SSH সার্ভার সাধারণত ইনস্টল করাই থাকে, তাই শুধু নিশ্চিত করা হচ্ছে।
           sudo apt-get update
-          
-          # প্রয়োজনীয় সফটওয়্যার ইনস্টল করা হচ্ছে
-          # xfce4: হালকা ডেস্কটপ এনভায়রনমেন্ট
-          # xfce4-goodies: ডেস্কটপের জন্য কিছু অতিরিক্ত টুলস
-          # xrdp: RDP সার্ভার
-          sudo apt-get install -y xfce4 xfce4-goodies xrdp
-          
-          # xrdp ইউজারকে ssl-cert গ্রুপে যোগ করা হচ্ছে, যা சில ক্ষেত্রে প্রয়োজন হয়
-          sudo adduser xrdp ssl-cert
-          
-          # xrdp কে বলা হচ্ছে যেন XFCE সেশন ব্যবহার করে
-          echo "xfce4-session" | sudo tee /etc/xrdp/startwm.sh
-          
-          # xrdp সার্ভিস রিস্টার্ট দেওয়া হচ্ছে যাতে পরিবর্তনগুলো কার্যকর হয়
-          sudo systemctl restart xrdp
+          sudo apt-get install -y openssh-server
+          sudo systemctl start ssh
 
-      - name: Create a new user for RDP
+      - name: ব্যবহারকারী এবং পাসওয়ার্ড তৈরি করুন (Create User and Password)
         run: |
-          # 'runner' নামে একটি নতুন ইউজার তৈরি করা হচ্ছে যার পাসওয়ার্ড হবে 'password'
-          # দ্রষ্টব্য: এখানে একটি দুর্বল পাসওয়ার্ড ব্যবহার করা হয়েছে, কিন্তু বাস্তবে GitHub Secrets ব্যবহার করা উচিত
-          sudo useradd -m -s /bin/bash runner
-          echo "runner:password" | sudo chpasswd
-          sudo adduser runner sudo # ইউজারকে sudo পারমিশন দেওয়া হচ্ছে
+          # একটি শক্তিশালী এবং র‍্যান্ডম পাসওয়ার্ড তৈরি করা হচ্ছে
+          PASSWORD=$(tr -dc 'A-Za-z0-9!"#$%&'\''()*+,-./:;<=>?@[\]^_`{|}~' </dev/urandom | head -c 16)
+          
+          # 'sshuser' নামে একটি নতুন ব্যবহারকারী তৈরি করা হচ্ছে
+          sudo useradd -m -s /bin/bash sshuser
+          
+          # তৈরি করা পাসওয়ার্ডটি নতুন ব্যবহারকারীর জন্য সেট করা হচ্ছে
+          echo "sshuser:$PASSWORD" | sudo chpasswd
+          
+          # ব্যবহারকারীকে sudo গ্রুপে যোগ করা হচ্ছে যাতে অ্যাডমিন অ্যাক্সেস থাকে
+          sudo usermod -aG sudo sshuser
+          
+          # লগইন তথ্য GitHub পরিবেশে সংরক্ষণ করা হচ্ছে
+          echo "SSH_CREDS=User: sshuser | Password: $PASSWORD" >> $GITHUB_ENV
+          
+          # ব্যবহারকারী তৈরি হয়েছে কিনা তা পরীক্ষা করা হচ্ছে
+          if ! id "sshuser" > /dev/null 2>&1; then
+              echo "ব্যবহারকারী তৈরি করতে ব্যর্থ হয়েছে"
+              exit 1
+          fi
+          echo "ব্যবহারকারী 'sshuser' সফলভাবে তৈরি হয়েছে।"
 
-      - name: Install and configure Tailscale
+      - name: Tailscale ইনস্টল করুন
         run: |
-          # Tailscale ইনস্টল করার স্ক্রিপ্ট চালানো হচ্ছে
+          # Tailscale-এর অফিসিয়াল ইনস্টলেশন স্ক্রিপ্ট ব্যবহার করে ইনস্টল করা হচ্ছে
           curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Tailscale কানেকশন স্থাপন করুন
+        run: |
+          # আপনার দেওয়া auth key ব্যবহার করে Tailscale চালু করা হচ্ছে
+          # --ssh ফ্ল্যাগ Tailscale-এর মাধ্যমে SSH অ্যাক্সেস সহজ করে, তবে আমরা এখানে স্ট্যান্ডার্ড SSH ব্যবহার করছি
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$GITHUB_RUN_ID
           
-          # Tailscale চালু করা হচ্ছে এবং আপনার অ্যাকাউন্টে যুক্ত করা হচ্ছে
-          # TAILSCALE_AUTH_KEY টিকে অবশ্যই আপনার GitHub repository-র Secrets এ যোগ করতে হবে
-          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-linux-$GITHUB_RUN_ID
+          # Tailscale IP পেতে কয়েক সেকেন্ড অপেক্ষা করা হচ্ছে
+          TS_IP=""
+          retries=0
+          while [ -z "$TS_IP" ] && [ "$retries" -lt 10 ]; do
+              TS_IP=$(tailscale ip -4)
+              sleep 5
+              retries=$((retries+1))
+          done
           
-          # Tailscale IP অ্যাড্রেস বের করা হচ্ছে
-          TS_IP=$(tailscale ip -4)
+          if [ -z "$TS_IP" ]; then
+              echo "Tailscale IP পেতে ব্যর্থ হয়েছে। workflow বন্ধ হচ্ছে।"
+              exit 1
+          fi
           echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
 
-      - name: Maintain Connection and Display Info
+      - name: SSH অ্যাক্সেস যাচাই করুন
         run: |
-          echo "========================================"
-          echo "          LINUX RDP ACCESS"
-          echo "========================================"
-          echo "Tailscale IP: ${{ env.TAILSCALE_IP }}"
-          echo "Username: runner"
-          echo "Password: password"
-          echo "========================================"
-          echo "Use Ctrl+C in the workflow log to terminate."
+          echo "Tailscale IP: $TAILSCALE_IP"
           
-          # ওয়ার্কফ্লোটিকে ৬ ঘণ্টা চালু রাখার জন্য একটি অসীম লুপ
+          # nc (netcat) ব্যবহার করে SSH পোর্ট (22) খোলা আছে কিনা তা পরীক্ষা করা হচ্ছে
+          if ! nc -zv $TAILSCALE_IP 22; then
+              echo "SSH পোর্ট 22-এ TCP কানেকশন ব্যর্থ হয়েছে"
+              exit 1
+          fi
+          echo "SSH পোর্টে TCP কানেকশন সফল হয়েছে!"
+
+      - name: কানেকশন চালু রাখুন
+        run: |
+          echo -e "\n=== SSH ACCESS ==="
+          echo "Address: $TAILSCALE_IP"
+          echo "Command: ssh sshuser@$TAILSCALE_IP"
+          echo "Credentials: $(echo $SSH_CREDS)"
+          echo -e "==================\n"
+          
+          # workflowটি চালু রাখার জন্য একটি অসীম লুপ চালানো হচ্ছে
+          # আপনি ম্যানুয়ালি Cancel না করা পর্যন্ত এটি চলতে থাকবে
           while true; do
-            sleep 300 # প্রতি ৫ মিনিট পর পর বার্তা দেখাবে
-            echo "[$(date)] RDP session is active."
+              echo "[$(date)] SSH Active - workflow বন্ধ করতে Cancel বাটনে ক্লিক করুন"
+              sleep 300
           done
