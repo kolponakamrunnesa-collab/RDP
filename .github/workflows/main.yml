@@ -1,93 +1,113 @@
-name: SSH Access
+name: RDP
 
 on:
   workflow_dispatch:
 
 jobs:
-  ssh-access:
-    runs-on: ubuntu-latest
+  secure-rdp:
+    runs-on: windows-latest
     timeout-minutes: 3600
 
     steps:
-      - name: SSH সার্ভার সেটআপ করুন
+      - name: Configure Core RDP Settings
         run: |
-          # Ubuntu রানারে SSH সার্ভার সাধারণত ইনস্টল করাই থাকে, তাই শুধু নিশ্চিত করা হচ্ছে।
-          sudo apt-get update
-          sudo apt-get install -y openssh-server
-          sudo systemctl start ssh
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
 
-      - name: ব্যবহারকারী এবং পাসওয়ার্ড তৈরি করুন (Create User and Password)
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
         run: |
-          # একটি শক্তিশালী এবং র‍্যান্ডম পাসওয়ার্ড তৈরি করা হচ্ছে
-          PASSWORD=$(tr -dc 'A-Za-z0-9!"#$%&'\''()*+,-./:;<=>?@[\]^_`{|}~' </dev/urandom | head -c 16)
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)      # A-Z
+              Lower   = [char[]](97..122)     # a-z
+              Number  = [char[]](48..57)      # 0-9
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126)) # Special characters
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
           
-          # 'sshuser' নামে একটি নতুন ব্যবহারকারী তৈরি করা হচ্ছে
-          sudo useradd -m -s /bin/bash sshuser
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
           
-          # তৈরি করা পাসওয়ার্ডটি নতুন ব্যবহারকারীর জন্য সেট করা হচ্ছে
-          echo "sshuser:$PASSWORD" | sudo chpasswd
-          
-          # ব্যবহারকারীকে sudo গ্রুপে যোগ করা হচ্ছে যাতে অ্যাডমিন অ্যাক্সেস থাকে
-          sudo usermod -aG sudo sshuser
-          
-          # লগইন তথ্য GitHub পরিবেশে সংরক্ষণ করা হচ্ছে
-          echo "SSH_CREDS=User: sshuser | Password: $PASSWORD" >> $GITHUB_ENV
-          
-          # ব্যবহারকারী তৈরি হয়েছে কিনা তা পরীক্ষা করা হচ্ছে
-          if ! id "sshuser" > /dev/null 2>&1; then
-              echo "ব্যবহারকারী তৈরি করতে ব্যর্থ হয়েছে"
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
               exit 1
-          fi
-          echo "ব্যবহারকারী 'sshuser' সফলভাবে তৈরি হয়েছে।"
+          }
 
-      - name: Tailscale ইনস্টল করুন
+      - name: Install Tailscale
         run: |
-          # Tailscale-এর অফিসিয়াল ইনস্টলেশন স্ক্রিপ্ট ব্যবহার করে ইনস্টল করা হচ্ছে
-          curl -fsSL https://tailscale.com/install.sh | sh
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
 
-      - name: Tailscale কানেকশন স্থাপন করুন
+      - name: Establish Tailscale Connection
         run: |
-          # আপনার দেওয়া auth key ব্যবহার করে Tailscale চালু করা হচ্ছে
-          # --ssh ফ্ল্যাগ Tailscale-এর মাধ্যমে SSH অ্যাক্সেস সহজ করে, তবে আমরা এখানে স্ট্যান্ডার্ড SSH ব্যবহার করছি
-          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$GITHUB_RUN_ID
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
           
-          # Tailscale IP পেতে কয়েক সেকেন্ড অপেক্ষা করা হচ্ছে
-          TS_IP=""
-          retries=0
-          while [ -z "$TS_IP" ] && [ "$retries" -lt 10 ]; do
-              TS_IP=$(tailscale ip -4)
-              sleep 5
-              retries=$((retries+1))
-          done
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
           
-          if [ -z "$TS_IP" ]; then
-              echo "Tailscale IP পেতে ব্যর্থ হয়েছে। workflow বন্ধ হচ্ছে।"
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
               exit 1
-          fi
-          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
-
-      - name: SSH অ্যাক্সেস যাচাই করুন
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+      
+      - name: Verify RDP Accessibility
         run: |
-          echo "Tailscale IP: $TAILSCALE_IP"
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           
-          # nc (netcat) ব্যবহার করে SSH পোর্ট (22) খোলা আছে কিনা তা পরীক্ষা করা হচ্ছে
-          if ! nc -zv $TAILSCALE_IP 22; then
-              echo "SSH পোর্ট 22-এ TCP কানেকশন ব্যর্থ হয়েছে"
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
               exit 1
-          fi
-          echo "SSH পোর্টে TCP কানেকশন সফল হয়েছে!"
+          }
+          Write-Host "TCP connectivity successful!"
 
-      - name: কানেকশন চালু রাখুন
+      - name: Maintain Connection
         run: |
-          echo -e "\n=== SSH ACCESS ==="
-          echo "Address: $TAILSCALE_IP"
-          echo "Command: ssh sshuser@$TAILSCALE_IP"
-          echo "Credentials: $(echo $SSH_CREDS)"
-          echo -e "==================\n"
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
           
-          # workflowটি চালু রাখার জন্য একটি অসীম লুপ চালানো হচ্ছে
-          # আপনি ম্যানুয়ালি Cancel না করা পর্যন্ত এটি চলতে থাকবে
-          while true; do
-              echo "[$(date)] SSH Active - workflow বন্ধ করতে Cancel বাটনে ক্লিক করুন"
-              sleep 300
-          done
+          # Keep runner active indefinitely (or until manually cancelled)
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
